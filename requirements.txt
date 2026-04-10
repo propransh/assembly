@@ -1,0 +1,10 @@
+flask
+flask-cors
+openai
+aiohttp
+networkx
+pymupdf
+python-dotenv
+tavily-python
+pydantic
+sentence-transformers
