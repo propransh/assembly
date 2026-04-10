@@ -17,6 +17,14 @@
 >
   View report →
 </button>
+<button class="inject-trigger" @click="showInjection = !showInjection">
+  ⚡ Inject event
+</button>
+
+<div class="injection-box" v-if="showInjection">
+  <textarea v-model="injectText" placeholder="Type a breaking event..." class="inject-input" rows="2" />
+  <button class="inject-submit" @click="submitInject">Inject →</button>
+</div>
       </div>
     </div>
 
@@ -57,8 +65,10 @@
       </div>
     </div>
   </div>
+  <InjectionPanel />
 </template>
 
+import InjectionPanel from './InjectionPanel.vue'
 <script setup>
 import { ref, onMounted, onUnmounted, computed } from 'vue'
 import * as d3 from 'd3'
@@ -189,6 +199,14 @@ const updateNodeColors = () => {
 
 const togglePause = () => {
   paused.value = !paused.value
+const showInjection = ref(false)
+const injectText = ref('')
+const submitInject = () => {
+  if (!injectText.value.trim()) return
+  addFeedMessage({ name: '⚡ BREAKING', stance: 'for' }, injectText.value)
+  injectText.value = ''
+  showInjection.value = false
+}
 }
 
 onMounted(() => {
@@ -290,7 +308,7 @@ onUnmounted(() => {
 </script>
 
 <style scoped>
-.sim-wrapper { display: flex; flex-direction: column; gap: 16px; padding: 20px; background: #0a0a0a; box-sizing: border-box; }
+.sim-wrapper { display: flex; flex-direction: column; position: relative; gap: 16px; padding: 20px; background: #0a0a0a; box-sizing: border-box; }
 .sim-header { display: flex; justify-content: space-between; align-items: flex-start; }
 .sim-topic { font-size: 16px; font-weight: 500; color: #fff; }
 .sim-status { font-size: 12px; color: #555; margin-top: 4px; }
@@ -298,7 +316,7 @@ onUnmounted(() => {
 .ctrl-btn { background: #111; border: 1px solid #2a2a2a; color: #aaa; padding: 6px 16px; border-radius: 20px; cursor: pointer; font-size: 13px; }
 .tick-label { font-size: 12px; color: #333; }
 .sim-body { display: flex; gap: 16px; flex: 1; min-height: 0; }
-.network-svg { flex: 1; background: #0f0f0f; border: 1px solid #1a1a1a; border-radius: 16px; height: 450px; }
+.network-svg { flex: 1; background: #0f0f0f; border: 1px solid #1a1a1a; border-radius: 16px; height: 450px; min-height: 450px; }
 
 .agent-panel { width: 280px; background: #111; border: 1px solid #1e1e1e; border-radius: 16px; padding: 20px; display: flex; flex-direction: column; gap: 12px; overflow-y: auto; }
 .panel-header { display: flex; align-items: center; gap: 10px; }
@@ -323,4 +341,8 @@ onUnmounted(() => {
 .feed-msg { font-size: 12px; display: flex; gap: 8px; }
 .feed-agent { font-weight: 500; white-space: nowrap; }
 .feed-text { color: #555; }
+.inject-trigger { background: #fff; color: #000; border: none; padding: 6px 14px; border-radius: 20px; font-size: 12px; font-weight: 500; cursor: pointer; }
+.injection-box { display: flex; flex-direction: column; gap: 6px; background: #111; border: 1px solid #222; border-radius: 10px; padding: 10px; width: 280px; }
+.inject-input { background: #0a0a0a; border: 1px solid #222; border-radius: 8px; color: #fff; font-size: 12px; padding: 8px; resize: none; font-family: sans-serif; }
+.inject-submit { background: #fff; color: #000; border: none; border-radius: 8px; padding: 6px; font-size: 12px; cursor: pointer; }
 </style>
