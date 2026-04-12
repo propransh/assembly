@@ -13,22 +13,23 @@ STANCE_MAP = {0: "strongly against", 1: "strongly for", 2: "neutral"}
 SCORE_RANGE = {
     "strongly against": (1.5, 3.5),
     "strongly for": (7.5, 9.5),
-    "neutral": (4.0, 6.0)
+    "neutral": (4.0, 6.0),
+    "for": (6.5, 9.0),
+    "against": (1.5, 4.0),
 }
 
 async def generate_single_persona(
     topic: str,
     G: nx.DiGraph,
     agent_index: int,
-    existing_names: list[str]
+    existing_names: list[str],
+    stakeholder: dict = None
 ) -> dict:
-    """Generate a single grounded agent persona from the knowledge graph."""
+    """Generate a single agent persona grounded in a real stakeholder."""
 
-    # Pull the most influential nodes from the graph
     influential_nodes = get_most_influential(G, top_n=15)
     claims = get_nodes_by_type(G, "claim")
 
-    # Format graph context for the LLM
     graph_context = "\n".join([
         f"- {n['name']} (cited {n['citations']}x, influence: {n['influence_score']:.3f}): {n.get('description', '')[:100]}"
         for n in influential_nodes
@@ -39,55 +40,69 @@ async def generate_single_persona(
         for c in claims[:10]
     ])
 
-    # Force a specific stance based on agent index
-    forced_stance = STANCE_MAP[agent_index % 3]
-    score_min, score_max = SCORE_RANGE[forced_stance]
     existing_names_str = ", ".join(existing_names) if existing_names else "none"
 
+    # Use stakeholder if available, otherwise fall back to forced stance
+    if stakeholder:
+        stance_tendency = stakeholder.get("stance", "neutral")
+        persuasion_resistance = stakeholder.get("persuasion_resistance", 0.5)
+        stakeholder_context = f"""You are generating an agent representing: {stakeholder['name']}
+Category: {stakeholder['category']}
+Their real-world position: {stakeholder['real_position']}
+Why they care: {stakeholder['stake']}
+Their known stance on this topic: {stance_tendency}
+Persuasion resistance: {persuasion_resistance} (0=easily convinced, 1=never convinced)"""
+        stakeholder_name = stakeholder["name"]
+        stakeholder_category = stakeholder["category"]
+    else:
+        forced = STANCE_MAP[agent_index % 3]
+        stance_tendency = forced
+        persuasion_resistance = 0.5
+        stakeholder_context = f"Generate a unique persona with stance: {forced}"
+        stakeholder_name = None
+        stakeholder_category = "individual"
+
+    score_range = SCORE_RANGE.get(stance_tendency, (4.0, 6.0))
+    score_min, score_max = score_range
+
     system = """You are designing a realistic human persona for a debate simulation.
-The persona must be grounded in the provided real-world knowledge graph data.
+The persona must represent the given stakeholder grounded in real knowledge graph data.
 Always respond in valid JSON."""
 
-    prompt = f"""Create a unique and realistic debate persona for agent {agent_index + 1}.
+    prompt = f"""Create a realistic debate persona for agent {agent_index + 1}.
 
-Topic being debated: {topic}
+Topic: {topic}
 
-Real-world knowledge graph context:
-Key entities and concepts:
+Stakeholder context:
+{stakeholder_context}
+
+Real-world knowledge graph:
 {graph_context}
 
-Key claims found in sources:
+Key claims:
 {claims_context}
 
-Names already used by other agents: {existing_names_str}
-(You MUST use a completely different name)
-
-Generate a persona that:
-1. Has a specific demographic background (age, profession, location)
-2. Has an opinion grounded in specific entities/claims from the knowledge graph above
-3. Feels like a real person, not a caricature
+Names already used: {existing_names_str}
 
 Respond in this exact JSON format:
 {{
-    "name": "full name",
-    "age": 30,
-    "profession": "job title",
+    "name": "full name of a specific person representing this stakeholder",
+    "age": 45,
+    "profession": "specific job title reflecting the stakeholder",
     "location": "city, country",
-    "persona": "2-3 sentence personality and background description",
-    "initial_opinion": "their specific opinion on the topic in 2 sentences, citing specific facts from the knowledge graph",
-    "key_beliefs": ["belief 1 grounded in graph", "belief 2 grounded in graph"],
-    "persuasion_resistance": 0.5,
+    "persona": "2-3 sentences about their background and why they hold their position",
+    "initial_opinion": "their specific opinion citing real facts from the knowledge graph",
+    "key_beliefs": ["belief grounded in graph", "belief grounded in graph"],
     "known_entities": ["entity1", "entity2", "entity3"]
 }}
 
 Rules:
-- initial_stance is LOCKED to: {forced_stance}
-- initial_score must be between {score_min} and {score_max} to reflect that stance
-- persuasion_resistance is between 0.1 (easily convinced) and 0.9 (very hard to convince)
-- known_entities must be actual entity names from the knowledge graph context above
-- initial_opinion must reference specific facts, not generic statements
-- Name must be unique — do NOT use any of these names: {existing_names_str}
-- Generate diverse demographics — vary nationality, age, profession"""
+- Name must be unique — not in: {existing_names_str}
+- Stance is LOCKED to: {stance_tendency}
+- Score must be between {score_min} and {score_max}
+- Persona must reflect the stakeholder's real interests
+- initial_opinion must cite specific facts from the knowledge graph
+- known_entities must be actual names from the graph above"""
 
     try:
         result = await call_llm_json(prompt, system)
@@ -96,19 +111,30 @@ Rules:
         import random
         score = round(random.uniform(score_min, score_max), 1)
 
+        # Clean up stance string
+        stance = stance_tendency
+        if stance in ["strongly against", "against"]:
+            stance = "against"
+        elif stance in ["strongly for", "for"]:
+            stance = "for"
+        else:
+            stance = "neutral"
+
         return {
             "id": f"agent_{uuid.uuid4().hex[:8]}",
             "name": persona.get("name", f"Agent {agent_index + 1}"),
-            "age": persona.get("age", 30),
+            "age": persona.get("age", 40),
             "profession": persona.get("profession", ""),
             "location": persona.get("location", ""),
             "persona": persona.get("persona", ""),
-            "stance": forced_stance.replace("strongly ", "").replace("strongly against", "against").replace("strongly for", "for"),
+            "stakeholder_name": stakeholder_name,
+            "stakeholder_category": stakeholder_category,
+            "stance": stance,
             "opinion": persona.get("initial_opinion", ""),
             "score": score,
             "opinion_delta": 0.0,
             "key_beliefs": persona.get("key_beliefs", []),
-            "persuasion_resistance": float(persona.get("persuasion_resistance", 0.5)),
+            "persuasion_resistance": persuasion_resistance,
             "known_entities": persona.get("known_entities", []),
             "memory": []
         }
@@ -117,11 +143,12 @@ Rules:
         print(f"[PersonaGenerator] Error generating persona {agent_index}: {e}")
         traceback.print_exc()
         return None
-
+    
 async def generate_personas(
     topic: str,
     G: nx.DiGraph,
-    num_agents: int = 20
+    num_agents: int = 20,
+    stakeholders: list[dict] = None
 ) -> list[dict]:
     print(f"[PersonaGenerator] Generating {num_agents} personas for topic: {topic}")
 
@@ -130,12 +157,13 @@ async def generate_personas(
 
     # Run sequentially to guarantee unique names and correct stance cycling
     for i in range(num_agents):
-        await asyncio.sleep(0.5)  # small delay between calls
-        persona = await generate_single_persona(topic, G, i, existing_names.copy())
+        await asyncio.sleep(0.5)
+        stakeholder = stakeholders[i] if stakeholders and i < len(stakeholders) else None
+        persona = await generate_single_persona(topic, G, i, existing_names.copy(), stakeholder)
         if persona:
             existing_names.append(persona["name"])
             valid_personas.append(persona)
-            print(f"[PersonaGenerator] Agent {i+1}: {persona['name']} | stance: {persona['stance']} | score: {persona['score']}")
+            print(f"[PersonaGenerator] Agent {i+1}: {persona['name']} | {persona.get('stakeholder_name', 'individual')} | stance: {persona['stance']} | score: {persona['score']}")
 
     print(f"[PersonaGenerator] Successfully generated {len(valid_personas)} personas")
     return valid_personas

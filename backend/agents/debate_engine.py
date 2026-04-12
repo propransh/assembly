@@ -101,7 +101,9 @@ Rules:
         updated_agent["stance"] = response.get("new_stance", agent["stance"])
         updated_agent["opinion_delta"] = opinion_delta
         updated_agent["last_argument"] = response.get("argument", "")
-        updated_agent["shifted"] = response.get("shifted", False)
+        stance_changed = updated_agent["stance"] != agent["stance"]
+        score_changed = opinion_delta > 1.5
+        updated_agent["shifted"] = stance_changed or score_changed
         updated_agent["shift_reason"] = response.get("shift_reason", "")
         updated_agent["key_evidence_used"] = response.get("key_evidence_used", [])
 

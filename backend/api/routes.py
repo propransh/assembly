@@ -10,6 +10,7 @@ from backend.ingestion.graph_builder import build_graph, get_graph_summary
 from backend.agents.persona_generator import generate_personas
 from backend.agents.debate_engine import run_debate
 from backend.report.report_agent import generate_report
+from backend.agents.stakeholder_identifier import identify_stakeholders
 
 api = Blueprint("api", __name__)
 
@@ -54,8 +55,9 @@ def start_simulation():
         G = run_async(build_graph(chunks))
         graph_summary = get_graph_summary(G)
 
-        # Step 3 — Generate personas grounded in graph
-        agents = run_async(generate_personas(topic, G, num_agents))
+        # Step 3 — Identify real stakeholders from graph and generate agents 
+        stakeholders = run_async(identify_stakeholders(topic, G, num_agents))
+        agents = run_async(generate_personas(topic, G, num_agents, stakeholders))
 
         # Step 4 — Run the debate
         debate_result = run_async(run_debate(topic, agents, G, num_rounds))
