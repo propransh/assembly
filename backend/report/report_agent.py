@@ -1,10 +1,161 @@
 import json
+import asyncio
 import sys
 import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 from backend.utils.llm_client import call_llm_json
 from backend.utils.graph_utils import get_most_influential
 import networkx as nx
+
+# ── Round Summarizer ──────────────────────────────────────────────
+
+async def summarize_round(round_data: dict, round_num: int) -> dict:
+    """
+    Compress a debate round into a structured summary.
+    Used to give the report agent full context without hitting token limits.
+    """
+    agents = round_data["agents"]
+    total = len(agents)
+    
+    shifted = [a for a in agents if a.get("opinion_delta", 0) > 0.3]
+    held = [a for a in agents if a.get("opinion_delta", 0) <= 0.3]
+    
+    avg_delta = sum(a.get("opinion_delta", 0) for a in agents) / total if total > 0 else 0
+    
+    stance_dist = {"for": 0, "against": 0, "neutral": 0}
+    for a in agents:
+        stance = a.get("stance", "neutral")
+        stance_dist[stance] = stance_dist.get(stance, 0) + 1
+
+    agent_summaries = "\n".join([
+        f"- {a['name']} ({a.get('stakeholder_name', 'individual')}): score={a['score']} stance={a['stance']} delta={a.get('opinion_delta', 0):.2f}"
+        for a in agents
+    ])
+
+    system = """You are summarizing a debate round for a simulation report.
+Be precise and factual. Reference specific agents and arguments.
+Respond in valid JSON only."""
+
+    prompt = f"""Summarize debate round {round_num}.
+
+Agent states this round:
+{agent_summaries}
+
+Agents who shifted: {[a['name'] for a in shifted]}
+Agents who held: {[a['name'] for a in held]}
+Average opinion delta: {avg_delta:.3f}
+Stance distribution: {stance_dist}
+
+Respond in this exact JSON format:
+{{
+    "round": {round_num},
+    "key_development": "the single most important thing that happened this round in 1 sentence",
+    "dominant_argument": "the argument that had the most influence this round",
+    "who_shifted": ["{shifted[0]['name'] if shifted else ''}"],
+    "why_they_shifted": "brief explanation of what caused shifts",
+    "who_held": ["{held[0]['name'] if held else ''}"],
+    "stance_distribution": {json.dumps(stance_dist)},
+    "avg_delta": {round(avg_delta, 3)}
+}}"""
+
+    try:
+        result = await call_llm_json(prompt, system)
+        return json.loads(result)
+    except Exception as e:
+        print(f"[ReportAgent] Round {round_num} summarizer error: {e}")
+        return {
+            "round": round_num,
+            "key_development": f"Round {round_num} completed",
+            "dominant_argument": "",
+            "who_shifted": [a["name"] for a in shifted],
+            "why_they_shifted": "",
+            "who_held": [a["name"] for a in held],
+            "stance_distribution": stance_dist,
+            "avg_delta": round(avg_delta, 3)
+        }
+
+async def summarize_all_rounds(rounds: list[dict]) -> list[dict]:
+    """Summarize all rounds in parallel."""
+    tasks = [summarize_round(r, r["round"]) for r in rounds]
+    summaries = await asyncio.gather(*tasks)
+    return list(summaries)
+
+# ── Verdict Calculator ────────────────────────────────────────────
+
+def calculate_verdict(final_agents: list[dict], rounds: list[dict]) -> dict:
+    """
+    Mathematically derive verdict confidence from Deffuant simulation data.
+    
+    confidence = (stance_concentration × 0.5) + (shift_rate × 0.3) + (delta_score × 0.2)
+    """
+    total = len(final_agents)
+    if total == 0:
+        return {"confidence": 0, "dominant_stance": "neutral", "verdict_strength": "inconclusive"}
+
+    # Stance concentration
+    stance_counts = {"for": 0, "against": 0, "neutral": 0}
+    for a in final_agents:
+        s = a.get("stance", "neutral")
+        stance_counts[s] = stance_counts.get(s, 0) + 1
+
+    dominant_stance = max(stance_counts, key=stance_counts.get)
+    dominant_count = stance_counts[dominant_stance]
+    stance_concentration = dominant_count / total
+
+    # Shift rate across all rounds
+    total_shifts = sum(
+        sum(1 for a in r["agents"] if a.get("opinion_delta", 0) > 0.3)
+        for r in rounds
+    )
+    total_agent_rounds = total * len(rounds)
+    shift_rate = total_shifts / total_agent_rounds if total_agent_rounds > 0 else 0
+
+    # Average delta score
+    all_deltas = [
+        a.get("opinion_delta", 0)
+        for r in rounds
+        for a in r["agents"]
+    ]
+    avg_delta = sum(all_deltas) / len(all_deltas) if all_deltas else 0
+    delta_score = min(avg_delta / 3.0, 1.0)
+
+    # Final confidence
+    confidence = (
+        stance_concentration * 0.5 +
+        shift_rate * 0.3 +
+        delta_score * 0.2
+    )
+    confidence_pct = round(confidence * 100, 1)
+
+    # Verdict strength label
+    if confidence_pct >= 70:
+        strength = "strong"
+    elif confidence_pct >= 45:
+        strength = "moderate"
+    else:
+        strength = "contested"
+
+    # Minority position
+    minority_stance = min(
+        {k: v for k, v in stance_counts.items() if k != dominant_stance},
+        key=lambda k: stance_counts[k]
+    )
+    minority_count = stance_counts[minority_stance]
+
+    return {
+        "dominant_stance": dominant_stance,
+        "dominant_count": dominant_count,
+        "minority_stance": minority_stance,
+        "minority_count": minority_count,
+        "neutral_count": stance_counts["neutral"],
+        "confidence_pct": confidence_pct,
+        "verdict_strength": strength,
+        "stance_concentration": round(stance_concentration, 3),
+        "shift_rate": round(shift_rate, 3),
+        "avg_delta": round(avg_delta, 3),
+    }
+
+# ── Main Report Generator ─────────────────────────────────────────
 
 async def generate_report(
     topic: str,
@@ -14,54 +165,41 @@ async def generate_report(
     G: nx.DiGraph
 ) -> dict:
     """
-    God's Eye View report agent.
-    Has access to the full simulation transcript and knowledge graph.
-    Synthesizes insights a single agent could never see.
+    God's Eye View report with round summaries and mathematically-backed verdict.
     """
-
     print(f"[ReportAgent] Generating God's Eye View for simulation {simulation_id}")
 
-    # ── Build full debate transcript ──────────────────────────────
-    transcript = []
-    for round_data in rounds:
-        for agent in round_data["agents"]:
-            transcript.append(
-                f"Round {round_data['round']} | {agent['name']} ({agent['stance']}) "
-                f"score={agent['score']} delta={agent['opinion_delta']}: {agent['opinion']}"
-            )
-    transcript_str = "\n".join(transcript)
+    # Step 1 — Summarize all rounds
+    print(f"[ReportAgent] Summarizing {len(rounds)} rounds...")
+    round_summaries = await summarize_all_rounds(rounds)
 
-    # ── Find who shifted and who held ────────────────────────────
-    first_round_agents = {
-        a["id"]: a for a in rounds[0]["agents"]
-    } if rounds else {}
+    # Step 2 — Calculate verdict mathematically
+    verdict_data = calculate_verdict(final_agents, rounds)
+
+    # Step 3 — Find who shifted and who held
+    first_round_agents = {a["id"]: a for a in rounds[0]["agents"]} if rounds else {}
 
     agents_shifted = []
     agents_held = []
 
     for agent in final_agents:
-        agent_id = agent["id"]
-        first_state = first_round_agents.get(agent_id)
-        
+        first_state = first_round_agents.get(agent["id"])
         if not first_state:
-            # fallback — use agent's own shift flag from debate engine
             shifted = agent.get("shifted", False)
             initial_stance = agent["stance"]
         else:
             initial_stance = first_state["stance"]
             final_stance = agent["stance"]
-            # check both stance change AND debate engine shift flag
             shifted = (initial_stance != final_stance) or agent.get("shifted", False)
 
         summary = {
-            "agent_id": agent_id,
+            "agent_id": agent["id"],
             "name": agent["name"],
+            "stakeholder": agent.get("stakeholder_name", "individual"),
             "shifted": shifted,
             "initial_stance": initial_stance,
-            "final_stance": final_stance,
-            "initial_score": first_state["score"],
+            "final_stance": agent["stance"],
             "final_score": agent["score"],
-            "total_delta": abs(agent["score"] - first_state["score"]),
             "key_moment": agent.get("shift_reason", "held firm throughout")
         }
 
@@ -70,8 +208,90 @@ async def generate_report(
         else:
             agents_held.append(summary)
 
-    # ── Find decisive arguments ───────────────────────────────────
-    # An argument is decisive if it caused multiple agents to shift
+    # Step 4 — Graph insights
+    top_entities = get_most_influential(G, top_n=3)
+    graph_context = "\n".join([
+        f"- {e['name']} (influence: {e['influence_score']:.3f}, cited {e['citations']}x)"
+        for e in top_entities
+    ])
+
+    # Step 5 — Build round summary context for LLM
+    round_context = "\n".join([
+        f"Round {s['round']}: {s['key_development']} | shifts: {len(s['who_shifted'])} | avg delta: {s['avg_delta']}"
+        for s in round_summaries
+    ])
+
+    # Step 6 — LLM generates verdict text + trajectory
+    system = """You are the God's Eye View analyst for a multi-agent debate simulation.
+You have seen the complete debate through structured round summaries.
+Generate a precise, evidence-backed analysis.
+Respond in valid JSON only."""
+
+    prompt = f"""Analyze this complete debate simulation.
+
+Topic: {topic}
+Total agents: {len(final_agents)}
+Agents shifted: {len(agents_shifted)}
+Agents held: {len(agents_held)}
+
+Verdict data (mathematically calculated):
+- Dominant stance: {verdict_data['dominant_stance']} ({verdict_data['dominant_count']} agents)
+- Minority stance: {verdict_data['minority_stance']} ({verdict_data['minority_count']} agents)
+- Confidence: {verdict_data['confidence_pct']}%
+- Verdict strength: {verdict_data['verdict_strength']}
+
+Round summaries:
+{round_context}
+
+Most influential knowledge graph entities:
+{graph_context}
+
+Generate the God's Eye View in this exact JSON format:
+{{
+    "summary": "2-3 sentence executive summary of what happened in the debate",
+    "predicted_trajectory": "specific prediction of real-world outcome based on debate dynamics, cite dominant arguments",
+    "verdict_statement": "one clear declarative sentence verdict on the proposition",
+    "decisive_factor": "the single argument or piece of evidence that most shaped the outcome",
+    "minority_position": "why the minority held firm and what that means for real-world implementation",
+    "real_world_implication": "what this debate result means for the real world in 1-2 sentences",
+    "actionable_insight": "one specific actionable recommendation for a decision-maker reading this",
+    "consensus_level": "high/medium/low"
+}}"""
+
+    try:
+        result = await call_llm_json(prompt, system)
+        synthesis = json.loads(result)
+    except Exception as e:
+        print(f"[ReportAgent] LLM synthesis error: {e}")
+        synthesis = {
+            "summary": "Debate completed.",
+            "predicted_trajectory": "Unable to generate trajectory.",
+            "verdict_statement": "Outcome inconclusive.",
+            "decisive_factor": "",
+            "minority_position": "",
+            "real_world_implication": "",
+            "actionable_insight": "",
+            "consensus_level": "medium"
+        }
+
+    # Step 7 — Sentiment per round
+    sentiment_ticks = []
+    for round_data in rounds:
+        agents_in_round = round_data["agents"]
+        total = len(agents_in_round)
+        if total == 0:
+            continue
+        positive = sum(1 for a in agents_in_round if a["stance"] == "for") / total
+        negative = sum(1 for a in agents_in_round if a["stance"] == "against") / total
+        neutral = sum(1 for a in agents_in_round if a["stance"] == "neutral") / total
+        sentiment_ticks.append({
+            "tick": round_data["round"],
+            "positive": round(positive, 2),
+            "neutral": round(neutral, 2),
+            "negative": round(negative, 2)
+        })
+
+    # Step 8 — Decisive arguments
     argument_influence = {}
     for agent in final_agents:
         if agent.get("shifted") and agent.get("last_argument"):
@@ -92,88 +312,32 @@ async def generate_report(
             "evidence_used": v["evidence_used"]
         }
         for v in argument_influence.values()
-        if len(v["influenced_agents"]) >= 1
     ][:5]
 
-    # ── Graph insights ────────────────────────────────────────────
-    top_entities = get_most_influential(G, top_n=3)
-    graph_context = "\n".join([
-        f"- {e['name']} (influence: {e['influence_score']:.3f}, cited {e['citations']}x)"
-        for e in top_entities
-    ])
-
-    # ── LLM synthesizes the God's Eye View ───────────────────────
-    system = """You are the God's Eye View analyst for a multi-agent debate simulation.
-You have seen the full debate transcript and all agent positions.
-Your job is to synthesize insights that no single agent could see.
-Respond in valid JSON only."""
-
-    prompt = f"""Analyze this complete debate simulation and generate a God's Eye View report.
-
-Topic: {topic}
-Total agents: {len(final_agents)}
-Agents who shifted opinion: {len(agents_shifted)}
-Agents who held firm: {len(agents_held)}
-
-Most influential knowledge graph entities:
-{graph_context}
-
-Full debate transcript:
-{transcript_str[:1500]}
-
-Generate a God's Eye View synthesis in this exact JSON format:
-{{
-    "summary": "2-3 sentence executive summary of what happened in the debate",
-    "predicted_trajectory": "Based on the debate dynamics, what is the predicted real-world trajectory of public opinion on this topic? Be specific and cite the dominant arguments.",
-    "dominant_narrative": "What was the strongest narrative that emerged?",
-    "key_turning_point": "What was the single moment or argument that changed the most minds?",
-    "consensus_level": "high/medium/low",
-    "actionable_insight": "One specific actionable insight for a decision maker reading this report"
-}}"""
-
-    try:
-        result = await call_llm_json(prompt, system)
-        synthesis = json.loads(result)
-    except Exception as e:
-        print(f"[ReportAgent] LLM synthesis error: {e}")
-        synthesis = {
-            "summary": "Debate completed successfully.",
-            "predicted_trajectory": "Unable to generate trajectory.",
-            "dominant_narrative": "",
-            "key_turning_point": "",
-            "consensus_level": "medium",
-            "actionable_insight": ""
-        }
-
-    # ── Calculate sentiment per round ─────────────────────────────
-    sentiment_ticks = []
-    for round_data in rounds:
-        agents_in_round = round_data["agents"]
-        total = len(agents_in_round)
-        if total == 0:
-            continue
-
-        positive = sum(1 for a in agents_in_round if a["stance"] == "for") / total
-        negative = sum(1 for a in agents_in_round if a["stance"] == "against") / total
-        neutral = sum(1 for a in agents_in_round if a["stance"] == "neutral") / total
-
-        sentiment_ticks.append({
-            "tick": round_data["round"],
-            "positive": round(positive, 2),
-            "neutral": round(neutral, 2),
-            "negative": round(negative, 2)
-        })
-
-    # ── Assemble final report ─────────────────────────────────────
+    # Step 9 — Assemble final report
     report = {
         "simulation_id": simulation_id,
         "topic": topic,
+
+        # The three main display fields
         "summary": synthesis.get("summary", ""),
         "predicted_trajectory": synthesis.get("predicted_trajectory", ""),
-        "dominant_narrative": synthesis.get("dominant_narrative", ""),
-        "key_turning_point": synthesis.get("key_turning_point", ""),
-        "consensus_level": synthesis.get("consensus_level", "medium"),
+        "verdict": {
+            "statement": synthesis.get("verdict_statement", ""),
+            "confidence_pct": verdict_data["confidence_pct"],
+            "strength": verdict_data["verdict_strength"],
+            "dominant_stance": verdict_data["dominant_stance"],
+            "dominant_count": verdict_data["dominant_count"],
+            "minority_stance": verdict_data["minority_stance"],
+            "minority_count": verdict_data["minority_count"],
+            "decisive_factor": synthesis.get("decisive_factor", ""),
+            "minority_position": synthesis.get("minority_position", ""),
+            "real_world_implication": synthesis.get("real_world_implication", ""),
+        },
+
+        # Supporting fields
         "actionable_insight": synthesis.get("actionable_insight", ""),
+        "consensus_level": synthesis.get("consensus_level", "medium"),
         "agents_shifted": len(agents_shifted),
         "agents_held": len(agents_held),
         "decisive_arguments": decisive_arguments,
@@ -181,12 +345,14 @@ Generate a God's Eye View synthesis in this exact JSON format:
             {
                 "agent_id": a["agent_id"],
                 "name": a["name"],
+                "stakeholder": a["stakeholder"],
                 "shifted": a["shifted"],
                 "final_stance": a["final_stance"],
                 "key_moment": a["key_moment"]
             }
             for a in agents_shifted + agents_held
         ],
+        "round_summaries": round_summaries,
         "sentiment_history": {
             "simulation_id": simulation_id,
             "ticks": sentiment_ticks
@@ -194,6 +360,7 @@ Generate a God's Eye View synthesis in this exact JSON format:
     }
 
     print(f"[ReportAgent] Report complete. "
-          f"{len(agents_shifted)} shifted, {len(agents_held)} held.")
+          f"{len(agents_shifted)} shifted, {len(agents_held)} held. "
+          f"Verdict: {verdict_data['dominant_stance']} ({verdict_data['confidence_pct']}% confidence)")
 
     return report

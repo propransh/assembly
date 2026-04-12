@@ -14,8 +14,8 @@ SCORE_RANGE = {
     "strongly against": (1.5, 3.5),
     "strongly for": (7.5, 9.5),
     "neutral": (4.0, 6.0),
-    "for": (6.5, 9.0),
-    "against": (1.5, 4.0),
+    "for": (5.5, 8.0),      # was 6.5-9.0
+    "against": (2.0, 5.5),  # was 1.5-4.0
 }
 
 async def generate_single_persona(

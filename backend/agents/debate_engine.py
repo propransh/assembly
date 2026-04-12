@@ -7,6 +7,57 @@ from backend.utils.llm_client import call_llm_json
 from backend.utils.graph_utils import query_graph
 import networkx as nx
 
+# ── Deffuant Model Parameters ─────────────────────────────────────
+BASE_MU = 0.3                # Base convergence rate (Deffuant 2000)
+CONFIDENCE_THRESHOLD = 3.0  # was 2.5 # Bounded confidence on 1-10 scale
+MAX_EVIDENCE_MULTIPLIER = 1.5  # Max boost from evidence-backed arguments
+
+def calculate_evidence_multiplier(evidence: list[dict]) -> float:
+    """
+    Calculate evidence multiplier based on citation strength.
+    Grounded in Elaboration Likelihood Model (Petty & Cacioppo 1986).
+    High citation count = stronger evidence = larger potential shift.
+    """
+    if not evidence:
+        return 1.0
+    avg_citations = sum(e.get("citations", 1) for e in evidence) / len(evidence)
+    multiplier = 1.0 + (min(avg_citations, 10) / 10) * (MAX_EVIDENCE_MULTIPLIER - 1.0)
+    return round(min(multiplier, MAX_EVIDENCE_MULTIPLIER), 3)
+
+def deffuant_update(
+    opinion_i: float,
+    opinion_j: float,
+    resistance_i: float,
+    evidence_multiplier: float
+) -> tuple[float, float]:
+    """
+    Core Deffuant bounded confidence update.
+    Returns (new_opinion, delta).
+
+    Only updates if |opinion_i - opinion_j| < CONFIDENCE_THRESHOLD.
+    Effective mu = BASE_MU * (1 - resistance) * evidence_multiplier
+    """
+    gap = abs(opinion_i - opinion_j)
+
+    if gap >= CONFIDENCE_THRESHOLD:
+        return opinion_i, 0.0
+
+    effective_mu = BASE_MU * (1 - resistance_i) * evidence_multiplier
+    delta = effective_mu * (opinion_j - opinion_i)
+    new_opinion = round(max(1.0, min(10.0, opinion_i + delta)), 2)
+    actual_delta = abs(new_opinion - opinion_i)
+
+    return new_opinion, actual_delta
+
+def derive_stance(score: float) -> str:
+    """Derive stance from numerical score."""
+    if score <= 3.5:
+        return "against"
+    elif score >= 6.5:
+        return "for"
+    else:
+        return "neutral"
+
 async def run_single_agent_round(
     agent: dict,
     all_agents: list[dict],
@@ -16,11 +67,12 @@ async def run_single_agent_round(
 ) -> dict:
     """
     Run a single agent through one debate round.
-    Agent queries graph for evidence, reads opponents, decides to shift or hold.
+    LLM generates argument text.
+    Deffuant model calculates opinion shift mathematically.
     """
 
-    # Step 1 — Agent pulls evidence from knowledge graph based on their beliefs
-    keywords = agent["key_beliefs"] + agent["known_entities"]
+    # Step 1 — Agent pulls evidence from knowledge graph
+    keywords = agent.get("key_beliefs", []) + agent.get("known_entities", [])
     evidence = query_graph(G, keywords, top_n=5)
 
     evidence_context = "\n".join([
@@ -28,89 +80,103 @@ async def run_single_agent_round(
         for e in evidence
     ])
 
-    # Step 2 — Agent reads what opponents said last round
+    # Step 2 — Read opponents' positions
     opponents = [a for a in all_agents if a["id"] != agent["id"]]
     opponent_context = "\n".join([
-        f"- {o['name']} ({o['stance']}): {o['opinion']}"
-        for o in opponents[:5]  # cap at 5 opponents to keep context manageable
+        f"- {o['name']} ({o['stance']}, score {o['score']}): {o['opinion']}"
+        for o in opponents[:6]
     ])
 
-    system = """You are simulating a realistic human debater.
-You are grounded in real evidence from a knowledge graph.
-You must respond in valid JSON only."""
+    # Step 3 — Find most influential opponent for Deffuant calculation
+    # Pick opponent whose opinion is closest but within threshold
+    influential_opponent = None
+    min_gap = float('inf')
+    for opp in opponents:
+        gap = abs(agent["score"] - opp["score"])
+        if gap < CONFIDENCE_THRESHOLD and gap < min_gap:
+            min_gap = gap
+            influential_opponent = opp
 
-    prompt = f"""You are {agent['name']}, {agent['profession']} from {agent['location']}.
-Your personality: {agent['persona']}
-Your persuasion resistance: {agent['persuasion_resistance']} (0=easily convinced, 1=never convinced)
+    # Step 4 — Calculate Deffuant shift BEFORE asking LLM
+    evidence_multiplier = calculate_evidence_multiplier(evidence)
+    old_score = agent["score"]
 
-Topic being debated: {topic}
-Current debate round: {round_num}
+    if influential_opponent:
+        new_score, delta = deffuant_update(
+            opinion_i=old_score,
+            opinion_j=influential_opponent["score"],
+            resistance_i=agent.get("persuasion_resistance", 0.5),
+            evidence_multiplier=evidence_multiplier
+        )
+    else:
+        # No opponent within threshold — no shift possible
+        new_score = old_score
+        delta = 0.0
+
+    new_stance = derive_stance(new_score)
+    shifted = delta > 0.3  # Meaningful shift threshold
+
+    # Step 5 — LLM generates argument text reflecting the math-decided outcome
+    system = """You are simulating a realistic human debater grounded in real evidence.
+Your opinion shift has already been mathematically calculated.
+Your job is to generate realistic argument text that reflects this outcome.
+Respond in valid JSON only."""
+
+    prompt = f"""You are {agent['name']}, representing {agent.get('stakeholder_name', 'yourself')}.
+Background: {agent['persona']}
+Persuasion resistance: {agent.get('persuasion_resistance', 0.5)} (0=easily convinced, 1=never)
+
+Topic: {topic}
+Round: {round_num}
 
 Your current position:
 - Opinion: {agent['opinion']}
-- Score: {agent['score']} (1=strongly against, 10=strongly for)
+- Score: {old_score}/10
 - Stance: {agent['stance']}
 
-Evidence available to you from real sources:
+Evidence available from real sources:
 {evidence_context}
 
-What other debaters said this round:
+What other debaters said:
 {opponent_context}
 
-Based on your personality, the evidence, and what others said:
-1. Form your argument using specific evidence from the sources above
-2. Decide if any opponent's argument genuinely moves you
-3. Update your opinion and score accordingly
+Mathematical outcome (already decided):
+- Your new score: {new_score}/10
+- Opinion shifted: {shifted}
+- {"You moved toward " + influential_opponent['name'] + "'s position" if influential_opponent and shifted else "You held your position firm"}
 
-Your persuasion_resistance of {agent['persuasion_resistance']} means:
-- Above 0.7: you rarely shift, need overwhelming evidence
-- 0.4-0.7: you shift if the argument is backed by strong evidence  
-- Below 0.4: you are open minded and shift more easily
+Generate argument text that reflects this outcome naturally.
 
 Respond in this exact JSON format:
 {{
-    "argument": "your argument this round, citing specific sources",
-    "responding_to": "which opponent you are responding to, or null",
-    "new_opinion": "your updated opinion in 2 sentences",
-    "new_score": 6.5,
-    "new_stance": "for/against/neutral",
-    "shifted": true,
-    "shift_reason": "why you shifted or why you held firm",
+    "argument": "your argument this round citing specific evidence",
+    "responding_to": "{influential_opponent['name'] if influential_opponent else 'the group'}",
+    "new_opinion": "your updated opinion in 2 sentences reflecting score {new_score}",
+    "shift_reason": "why you {'moved slightly' if shifted else 'held firm'} on this issue",
     "key_evidence_used": ["evidence point 1", "evidence point 2"]
-}}
-
-Rules:
-- new_score must be between 1.0 and 10.0
-- Be realistic — don't shift dramatically in one round
-- If you shift, the shift should be proportional to your persuasion_resistance
-- Always cite specific evidence from the sources provided above"""
+}}"""
 
     try:
         result = await call_llm_json(prompt, system)
         response = json.loads(result)
 
-        # Calculate opinion delta
-        old_score = agent["score"]
-        new_score = float(response.get("new_score", old_score))
-        opinion_delta = abs(new_score - old_score)
-
-        # Update agent state
         updated_agent = agent.copy()
         updated_agent["opinion"] = response.get("new_opinion", agent["opinion"])
         updated_agent["score"] = new_score
-        updated_agent["stance"] = response.get("new_stance", agent["stance"])
-        updated_agent["opinion_delta"] = opinion_delta
+        updated_agent["stance"] = new_stance
+        updated_agent["opinion_delta"] = delta
         updated_agent["last_argument"] = response.get("argument", "")
-        stance_changed = updated_agent["stance"] != agent["stance"]
-        score_changed = opinion_delta > 1.5
-        updated_agent["shifted"] = stance_changed or score_changed
+        updated_agent["shifted"] = shifted
         updated_agent["shift_reason"] = response.get("shift_reason", "")
         updated_agent["key_evidence_used"] = response.get("key_evidence_used", [])
+        updated_agent["responding_to"] = response.get("responding_to", "")
+        updated_agent["evidence_multiplier"] = evidence_multiplier
+        updated_agent["deffuant_gap"] = round(min_gap, 2) if influential_opponent else None
 
         return updated_agent
 
     except Exception as e:
-        print(f"[DebateEngine] Error in round {round_num} for agent {agent['name']}: {e}")
+        print(f"[DebateEngine] Error in round {round_num} for {agent['name']}: {e}")
         return agent
 
 async def run_debate_round(
@@ -119,20 +185,11 @@ async def run_debate_round(
     G: nx.DiGraph,
     round_num: int
 ) -> list[dict]:
-    """
-    Run all agents through a debate round in parallel.
-    Every agent thinks simultaneously — no sequential bottleneck.
-    """
+    """Run all agents through a debate round in parallel."""
     print(f"[DebateEngine] Running round {round_num} with {len(agents)} agents...")
 
     tasks = [
-        run_single_agent_round(
-            agent=agent,
-            all_agents=agents,
-            topic=topic,
-            G=G,
-            round_num=round_num
-        )
+        run_single_agent_round(agent, agents, topic, G, round_num)
         for agent in agents
     ]
 
@@ -145,25 +202,17 @@ async def run_debate(
     G: nx.DiGraph,
     num_rounds: int = 3
 ) -> dict:
-    """
-    Run the full structured debate.
-    Returns all rounds with agent states and opinion trajectories.
-    """
+    """Run the full structured debate with Deffuant opinion dynamics."""
     print(f"[DebateEngine] Starting debate on: {topic}")
     print(f"[DebateEngine] {len(agents)} agents, {num_rounds} rounds")
+    print(f"[DebateEngine] Deffuant params: mu={BASE_MU}, threshold={CONFIDENCE_THRESHOLD}")
 
     all_rounds = []
     current_agents = agents.copy()
 
     for round_num in range(1, num_rounds + 1):
-        updated_agents = await run_debate_round(
-            agents=current_agents,
-            topic=topic,
-            G=G,
-            round_num=round_num
-        )
+        updated_agents = await run_debate_round(current_agents, topic, G, round_num)
 
-        # Record this round
         round_result = {
             "round": round_num,
             "agents": [
@@ -175,6 +224,10 @@ async def run_debate(
                     "score": a["score"],
                     "opinion_delta": a["opinion_delta"],
                     "stance": a["stance"],
+                    "stakeholder_name": a.get("stakeholder_name"),
+                    "stakeholder_category": a.get("stakeholder_category"),
+                    "deffuant_gap": a.get("deffuant_gap"),
+                    "evidence_multiplier": a.get("evidence_multiplier"),
                 }
                 for a in updated_agents
             ]
@@ -183,8 +236,9 @@ async def run_debate(
         all_rounds.append(round_result)
         current_agents = updated_agents
 
-        print(f"[DebateEngine] Round {round_num} complete. "
-              f"Shifts: {sum(1 for a in updated_agents if a.get('shifted', False))}/{len(updated_agents)}")
+        shifts = sum(1 for a in updated_agents if a.get("shifted", False))
+        avg_delta = sum(a.get("opinion_delta", 0) for a in updated_agents) / len(updated_agents)
+        print(f"[DebateEngine] Round {round_num} complete. Shifts: {shifts}/{len(updated_agents)} | Avg delta: {avg_delta:.3f}")
 
     return {
         "rounds": all_rounds,
