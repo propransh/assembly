@@ -47,21 +47,29 @@ def normalize_type(raw_type: str) -> str:
 def find_similar_node(G: nx.DiGraph, name: str) -> str | None:
     """
     Find an existing node that likely refers to the same entity.
-    Handles common variations like 'U.S.' vs 'US' vs 'United States'.
+    Minimum length of 7 chars required to avoid false matches like
+    'India' matching 'Indiana' or 'Indian Ocean'.
     """
     name_lower = name.lower().strip()
     name_clean = name_lower.replace(".", "").replace(",", "").replace("-", " ")
+
+    # Too short to safely match
+    if len(name_clean) < 7:
+        return None
 
     for existing in G.nodes:
         existing_lower = existing.lower().strip()
         existing_clean = existing_lower.replace(".", "").replace(",", "").replace("-", " ")
 
+        if len(existing_clean) < 7:
+            continue
+
         # Exact match after cleaning
         if name_clean == existing_clean:
             return existing
 
-        # One contains the other (handles "US Government" vs "United States Government")
-        if len(name_clean) > 4 and len(existing_clean) > 4:
+        # One contains the other — only if both are long enough
+        if len(name_clean) > 8 and len(existing_clean) > 8:
             if name_clean in existing_clean or existing_clean in name_clean:
                 return existing
 

@@ -31,6 +31,8 @@ async def summarize_round(round_data: dict, round_num: int) -> dict:
         f"- {a['name']} ({a.get('stakeholder_name', 'individual')}): score={a['score']} stance={a['stance']} delta={a.get('opinion_delta', 0):.2f}"
         for a in agents
     ])
+    shifted_names = [a["name"] for a in shifted]
+    held_names = [a["name"] for a in held]
 
     system = """You are summarizing a debate round for a simulation report.
 Be precise and factual. Reference specific agents and arguments.
@@ -41,8 +43,8 @@ Respond in valid JSON only."""
 Agent states this round:
 {agent_summaries}
 
-Agents who shifted: {[a['name'] for a in shifted]}
-Agents who held: {[a['name'] for a in held]}
+Agents who shifted: {shifted_names}
+Agents who held firm: {held_names}
 Average opinion delta: {avg_delta:.3f}
 Stance distribution: {stance_dist}
 
@@ -51,13 +53,12 @@ Respond in this exact JSON format:
     "round": {round_num},
     "key_development": "the single most important thing that happened this round in 1 sentence",
     "dominant_argument": "the argument that had the most influence this round",
-    "who_shifted": ["{shifted[0]['name'] if shifted else ''}"],
+    "who_shifted": {json.dumps(shifted_names)},
     "why_they_shifted": "brief explanation of what caused shifts",
-    "who_held": ["{held[0]['name'] if held else ''}"],
+    "who_held": {json.dumps(held_names)},
     "stance_distribution": {json.dumps(stance_dist)},
     "avg_delta": {round(avg_delta, 3)}
 }}"""
-
     try:
         result = await call_llm_json(prompt, system)
         return json.loads(result)

@@ -8,16 +8,11 @@ from backend.utils.graph_utils import query_graph
 import networkx as nx
 
 # ── Deffuant Model Parameters ─────────────────────────────────────
-BASE_MU = 0.3                # Base convergence rate (Deffuant 2000)
-CONFIDENCE_THRESHOLD = 3.0  # was 2.5 # Bounded confidence on 1-10 scale
-MAX_EVIDENCE_MULTIPLIER = 1.5  # Max boost from evidence-backed arguments
+BASE_MU = 0.3
+CONFIDENCE_THRESHOLD = 3.0
+MAX_EVIDENCE_MULTIPLIER = 1.5
 
 def calculate_evidence_multiplier(evidence: list[dict]) -> float:
-    """
-    Calculate evidence multiplier based on citation strength.
-    Grounded in Elaboration Likelihood Model (Petty & Cacioppo 1986).
-    High citation count = stronger evidence = larger potential shift.
-    """
     if not evidence:
         return 1.0
     avg_citations = sum(e.get("citations", 1) for e in evidence) / len(evidence)
@@ -30,27 +25,16 @@ def deffuant_update(
     resistance_i: float,
     evidence_multiplier: float
 ) -> tuple[float, float]:
-    """
-    Core Deffuant bounded confidence update.
-    Returns (new_opinion, delta).
-
-    Only updates if |opinion_i - opinion_j| < CONFIDENCE_THRESHOLD.
-    Effective mu = BASE_MU * (1 - resistance) * evidence_multiplier
-    """
     gap = abs(opinion_i - opinion_j)
-
     if gap >= CONFIDENCE_THRESHOLD:
         return opinion_i, 0.0
-
     effective_mu = BASE_MU * (1 - resistance_i) * evidence_multiplier
     delta = effective_mu * (opinion_j - opinion_i)
     new_opinion = round(max(1.0, min(10.0, opinion_i + delta)), 2)
     actual_delta = abs(new_opinion - opinion_i)
-
     return new_opinion, actual_delta
 
 def derive_stance(score: float) -> str:
-    """Derive stance from numerical score."""
     if score <= 3.5:
         return "against"
     elif score >= 6.5:
@@ -65,13 +49,7 @@ async def run_single_agent_round(
     G: nx.DiGraph,
     round_num: int
 ) -> dict:
-    """
-    Run a single agent through one debate round.
-    LLM generates argument text.
-    Deffuant model calculates opinion shift mathematically.
-    """
-
-    # Step 1 — Agent pulls evidence from knowledge graph
+    # Step 1 — Pull evidence from knowledge graph
     keywords = agent.get("key_beliefs", []) + agent.get("known_entities", [])
     evidence = query_graph(G, keywords, top_n=5)
 
@@ -80,47 +58,63 @@ async def run_single_agent_round(
         for e in evidence
     ])
 
-    # Step 2 — Read opponents' positions
+    # Step 2 — Read opponents
     opponents = [a for a in all_agents if a["id"] != agent["id"]]
     opponent_context = "\n".join([
         f"- {o['name']} ({o['stance']}, score {o['score']}): {o['opinion']}"
         for o in opponents[:6]
     ])
 
-    # Step 3 — Find most influential opponent for Deffuant calculation
-    # Pick opponent whose opinion is closest but within threshold
-    influential_opponent = None
-    min_gap = float('inf')
-    for opp in opponents:
-        gap = abs(agent["score"] - opp["score"])
-        if gap < CONFIDENCE_THRESHOLD and gap < min_gap:
-            min_gap = gap
-            influential_opponent = opp
+    # Step 3 — Find all opponents within threshold
+    within_threshold = [
+        opp for opp in opponents
+        if abs(agent["score"] - opp["score"]) < CONFIDENCE_THRESHOLD
+    ]
 
-    # Step 4 — Calculate Deffuant shift BEFORE asking LLM
+    # Step 4 — Weighted average Deffuant update
     evidence_multiplier = calculate_evidence_multiplier(evidence)
     old_score = agent["score"]
 
-    if influential_opponent:
+    if within_threshold:
+        weights = [
+            1.0 / (abs(agent["score"] - opp["score"]) + 0.1)
+            for opp in within_threshold
+        ]
+        total_weight = sum(weights)
+        weighted_avg = sum(
+            opp["score"] * w for opp, w in zip(within_threshold, weights)
+        ) / total_weight
+
         new_score, delta = deffuant_update(
             opinion_i=old_score,
-            opinion_j=influential_opponent["score"],
+            opinion_j=weighted_avg,
             resistance_i=agent.get("persuasion_resistance", 0.5),
             evidence_multiplier=evidence_multiplier
         )
+
+        influential_opponent = min(
+            within_threshold,
+            key=lambda o: abs(agent["score"] - o["score"])
+        )
+        min_gap = abs(agent["score"] - influential_opponent["score"])
     else:
-        # No opponent within threshold — no shift possible
         new_score = old_score
         delta = 0.0
+        influential_opponent = None
+        min_gap = float('inf')
 
+    # Step 5 — Derive stance and shift BEFORE calling LLM
     new_stance = derive_stance(new_score)
-    shifted = delta > 0.3  # Meaningful shift threshold
+    shifted = delta > 0.05  # was 0.3 — too high for high-resistance agents
 
-    # Step 5 — LLM generates argument text reflecting the math-decided outcome
+    # Step 6 — LLM generates argument text reflecting math-decided outcome
     system = """You are simulating a realistic human debater grounded in real evidence.
 Your opinion shift has already been mathematically calculated.
 Your job is to generate realistic argument text that reflects this outcome.
 Respond in valid JSON only."""
+
+    opponent_name = influential_opponent['name'] if influential_opponent else 'the group'
+    shift_direction = f"You moved toward {opponent_name}'s position" if influential_opponent and shifted else "You held your position firm"
 
     prompt = f"""You are {agent['name']}, representing {agent.get('stakeholder_name', 'yourself')}.
 Background: {agent['persona']}
@@ -143,14 +137,14 @@ What other debaters said:
 Mathematical outcome (already decided):
 - Your new score: {new_score}/10
 - Opinion shifted: {shifted}
-- {"You moved toward " + influential_opponent['name'] + "'s position" if influential_opponent and shifted else "You held your position firm"}
+- {shift_direction}
 
 Generate argument text that reflects this outcome naturally.
 
 Respond in this exact JSON format:
 {{
     "argument": "your argument this round citing specific evidence",
-    "responding_to": "{influential_opponent['name'] if influential_opponent else 'the group'}",
+    "responding_to": "{opponent_name}",
     "new_opinion": "your updated opinion in 2 sentences reflecting score {new_score}",
     "shift_reason": "why you {'moved slightly' if shifted else 'held firm'} on this issue",
     "key_evidence_used": ["evidence point 1", "evidence point 2"]
@@ -185,14 +179,11 @@ async def run_debate_round(
     G: nx.DiGraph,
     round_num: int
 ) -> list[dict]:
-    """Run all agents through a debate round in parallel."""
     print(f"[DebateEngine] Running round {round_num} with {len(agents)} agents...")
-
     tasks = [
         run_single_agent_round(agent, agents, topic, G, round_num)
         for agent in agents
     ]
-
     updated_agents = await asyncio.gather(*tasks)
     return list(updated_agents)
 
@@ -202,7 +193,6 @@ async def run_debate(
     G: nx.DiGraph,
     num_rounds: int = 3
 ) -> dict:
-    """Run the full structured debate with Deffuant opinion dynamics."""
     print(f"[DebateEngine] Starting debate on: {topic}")
     print(f"[DebateEngine] {len(agents)} agents, {num_rounds} rounds")
     print(f"[DebateEngine] Deffuant params: mu={BASE_MU}, threshold={CONFIDENCE_THRESHOLD}")

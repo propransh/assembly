@@ -97,12 +97,13 @@ Respond in this exact JSON format:
 }}
 
 Rules:
+- If the stakeholder is a well-known organization, use their ACTUAL real-world representative
+  (e.g. Meta → Mark Zuckerberg, European Union → Ursula von der Leyen, OpenAI → Sam Altman)
+- Only invent a name if the stakeholder has no single known representative
+- No "Dr." prefix unless the real person actually uses it
 - Name must be unique — not in: {existing_names_str}
-- Stance is LOCKED to: {stance_tendency}
-- Score must be between {score_min} and {score_max}
-- Persona must reflect the stakeholder's real interests
-- initial_opinion must cite specific facts from the knowledge graph
-- known_entities must be actual names from the graph above"""
+- The following names are already taken, use someone else: {existing_names_str}
+- This is a hard rule — generating a duplicate name will break the simulation"""
 
     try:
         result = await call_llm_json(prompt, system)

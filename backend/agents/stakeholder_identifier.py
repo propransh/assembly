@@ -9,16 +9,16 @@ import networkx as nx
 
 # Category defaults — only resistance and influence, never stance
 STAKEHOLDER_CATEGORIES = {
-    "tech_company":       {"persuasion_resistance": 0.75, "influence_weight": 0.90},
-    "government":         {"persuasion_resistance": 0.85, "influence_weight": 0.95},
-    "civil_society":      {"persuasion_resistance": 0.60, "influence_weight": 0.65},
-    "academic":           {"persuasion_resistance": 0.50, "influence_weight": 0.70},
-    "labor_union":        {"persuasion_resistance": 0.70, "influence_weight": 0.60},
-    "consumer":           {"persuasion_resistance": 0.30, "influence_weight": 0.40},
-    "media":              {"persuasion_resistance": 0.60, "influence_weight": 0.55},
-    "investor":           {"persuasion_resistance": 0.65, "influence_weight": 0.75},
-    "affected_community": {"persuasion_resistance": 0.55, "influence_weight": 0.50},
-    "international_body": {"persuasion_resistance": 0.80, "influence_weight": 0.85},
+    "tech_company":       {"persuasion_resistance": 0.55, "influence_weight": 0.90},
+    "government":         {"persuasion_resistance": 0.65, "influence_weight": 0.95},
+    "civil_society":      {"persuasion_resistance": 0.40, "influence_weight": 0.65},
+    "academic":           {"persuasion_resistance": 0.30, "influence_weight": 0.70},
+    "labor_union":        {"persuasion_resistance": 0.50, "influence_weight": 0.60},
+    "consumer":           {"persuasion_resistance": 0.20, "influence_weight": 0.40},
+    "media":              {"persuasion_resistance": 0.40, "influence_weight": 0.55},
+    "investor":           {"persuasion_resistance": 0.45, "influence_weight": 0.75},
+    "affected_community": {"persuasion_resistance": 0.35, "influence_weight": 0.50},
+    "international_body": {"persuasion_resistance": 0.60, "influence_weight": 0.85},
 }
 
 MAX_CATEGORY_SHARE = 0.30  # No single category can exceed 30% of agents
